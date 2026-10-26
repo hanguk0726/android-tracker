@@ -14,6 +14,8 @@ import android.os.Handler
 import android.view.PixelCopy
 import android.view.View
 import android.view.ViewGroup
+import android.view.WindowManager
+import android.view.inspector.WindowInspector
 import androidx.compose.ui.platform.AbstractComposeView
 import androidx.compose.ui.platform.ComposeView
 import com.openreplay.tracker.OpenReplay
@@ -399,15 +401,17 @@ object ScreenshotManager {
             val mutableBitmap = bitmap.copy(Bitmap.Config.ARGB_8888, true)
             val canvas = Canvas(mutableBitmap)
             
+            // Screen coordinates, not window coordinates: a sanitized view may live in another
+            // window (Dialog) that drawAttachedWindows() composited on top of the activity window.
             val rootViewLocation = IntArray(2)
-            rootView.getLocationInWindow(rootViewLocation)
+            rootView.getLocationOnScreen(rootViewLocation)
             
             var maskedCount = 0
             sanitizedElements.forEach { weakRef ->
                 val sanitizedView = weakRef.get()
                 if (sanitizedView != null && sanitizedView.visibility == View.VISIBLE && sanitizedView.isAttachedToWindow) {
                     val location = IntArray(2)
-                    sanitizedView.getLocationInWindow(location)
+                    sanitizedView.getLocationOnScreen(location)
                     
                     val x = location[0] - rootViewLocation[0]
                     val y = location[1] - rootViewLocation[1]
@@ -688,6 +692,7 @@ object ScreenshotManager {
 
                         when (copyResult) {
                             PixelCopy.SUCCESS -> {
+                                drawAttachedWindows(activity, bitmap)
                                 try {
                                     val maskedBitmap = applyMaskToScreenshot(bitmap, view)
                                     once(Result.success(maskedBitmap))
@@ -700,7 +705,10 @@ object ScreenshotManager {
                                 DebugUtils.error("PixelCopy failed with result: $copyResult, falling back to oldViewToBitmap")
                                 bitmap.recycle()
                                 try {
-                                    once(Result.success(oldViewToBitmap(view)))
+                                    val fallback = oldViewToBitmap(view)
+                                    drawAttachedWindows(activity, fallback)
+                                    // Re-mask: windows drawn on top may hold sanitized views.
+                                    once(Result.success(applyMaskToScreenshot(fallback, view)))
                                 } catch (e: Exception) {
                                     DebugUtils.error("Fallback screenshot failed: ${e.message}")
                                     once(Result.failure(e))
@@ -723,6 +731,65 @@ object ScreenshotManager {
             } catch (e: Exception) {
                 DebugUtils.error("Screenshot failed: ${e.message}")
                 once(Result.failure(e))
+            }
+        }
+    }
+
+    /**
+     * PixelCopy(activity.window) copies only the activity's own window. A Dialog or PopupWindow
+     * (React Native `<Modal>` is a Dialog on Android) is a separate window, so it was missing from
+     * every frame. Draw the activity's other visible windows on top, in window order, honouring
+     * FLAG_DIM_BEHIND. Best-effort: a window that fails to draw is skipped (previous behaviour).
+     */
+    private fun drawAttachedWindows(activity: Activity, base: Bitmap) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return // WindowInspector: API 29
+        val decor = activity.window?.decorView ?: return
+        if (decor.width <= 0 || decor.height <= 0 || !base.isMutable) return
+        // A Dialog's window carries the activity token in its LayoutParams; a PopupWindow
+        // (sub-window) carries the activity window's own token.
+        val activityToken = (decor.layoutParams as? WindowManager.LayoutParams)?.token
+        val decorWindowToken = decor.windowToken
+        val all = try {
+            WindowInspector.getGlobalWindowViews()
+        } catch (e: Exception) {
+            DebugUtils.log("WindowInspector failed: ${e.message}")
+            return
+        }
+        val windows = all.filter {
+            val token = (it.layoutParams as? WindowManager.LayoutParams)?.token
+            it !== decor && it.isAttachedToWindow && it.isShown && it.width > 0 && it.height > 0 &&
+                token != null && (token === activityToken || token === decorWindowToken)
+        }
+        if (windows.isEmpty()) return
+
+        val decorLocation = IntArray(2)
+        decor.getLocationOnScreen(decorLocation)
+        // The capture bitmap is display-sized; PixelCopy scaled the window into it.
+        val scaleX = base.width / decor.width.toFloat()
+        val scaleY = base.height / decor.height.toFloat()
+        val canvas = Canvas(base)
+        for (window in windows) {
+            try {
+                val params = window.layoutParams as? WindowManager.LayoutParams
+                if (params != null && params.flags and WindowManager.LayoutParams.FLAG_DIM_BEHIND != 0) {
+                    canvas.drawColor(Color.argb((params.dimAmount.coerceIn(0f, 1f) * 255).toInt(), 0, 0, 0))
+                }
+                val layer = Bitmap.createBitmap(window.width, window.height, Bitmap.Config.ARGB_8888)
+                window.draw(Canvas(layer))
+                val location = IntArray(2)
+                window.getLocationOnScreen(location)
+                canvas.save()
+                canvas.scale(scaleX, scaleY)
+                canvas.drawBitmap(
+                    layer,
+                    (location[0] - decorLocation[0]).toFloat(),
+                    (location[1] - decorLocation[1]).toFloat(),
+                    null
+                )
+                canvas.restore()
+                layer.recycle()
+            } catch (e: Exception) {
+                DebugUtils.log("Skipping window ${window.javaClass.simpleName}: ${e.message}")
             }
         }
     }
