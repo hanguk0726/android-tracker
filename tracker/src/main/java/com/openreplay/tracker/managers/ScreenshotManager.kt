@@ -8,10 +8,12 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Rect
+import android.graphics.RectF
 import android.graphics.Shader
 import android.os.Build
 import android.os.Handler
 import android.view.PixelCopy
+import android.view.SurfaceView
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
@@ -88,6 +90,10 @@ object ScreenshotManager {
     // and only logged in debug builds. A long unbroken run means the replay is silently
     // frozen, so it is reported once at error level, which logs in release builds too.
     private const val SKIP_STREAK_ERROR_THRESHOLD = 10
+
+    // Capture runs on a fixed interval; a SurfaceView copy that has not answered by then is
+    // dropped for this frame rather than delaying it.
+    private const val SURFACE_COPY_TIMEOUT_MS = 300L
     private val consecutiveSkips = AtomicInteger(0)
 
     fun setSettings(settings: Triple<Int, Int, Int>) {
@@ -692,13 +698,20 @@ object ScreenshotManager {
 
                         when (copyResult) {
                             PixelCopy.SUCCESS -> {
-                                drawAttachedWindows(activity, bitmap)
-                                try {
-                                    val maskedBitmap = applyMaskToScreenshot(bitmap, view)
-                                    once(Result.success(maskedBitmap))
-                                } catch (e: Exception) {
-                                    DebugUtils.error("Failed to apply mask: ${e.message}")
-                                    once(Result.success(bitmap))
+                                drawSurfaceViewsBeneath(view, bitmap) { composed ->
+                                    if (activity.isFinishing || activity.isDestroyed) {
+                                        composed.recycle()
+                                        fail("Activity is finishing or destroyed")
+                                        return@drawSurfaceViewsBeneath
+                                    }
+                                    drawAttachedWindows(activity, composed)
+                                    try {
+                                        val maskedBitmap = applyMaskToScreenshot(composed, view)
+                                        once(Result.success(maskedBitmap))
+                                    } catch (e: Exception) {
+                                        DebugUtils.error("Failed to apply mask: ${e.message}")
+                                        once(Result.success(composed))
+                                    }
                                 }
                             }
                             else -> {
@@ -732,6 +745,95 @@ object ScreenshotManager {
                 DebugUtils.error("Screenshot failed: ${e.message}")
                 once(Result.failure(e))
             }
+        }
+    }
+
+    /**
+     * PixelCopy(activity.window) leaves every SurfaceView (video — e.g. the WebRTC renderer) empty:
+     * a SurfaceView has its own surface composited beneath the window, and the window only holds a
+     * transparent hole over it. Copy each visible SurfaceView's surface and draw it beneath the window
+     * capture, so the views drawn over the video stay on top. Best-effort: a surface that fails to
+     * copy, or does not answer within SURFACE_COPY_TIMEOUT_MS, is left as before (empty).
+     * [done] is always called exactly once, on the main thread, with the bitmap to use.
+     */
+    private fun drawSurfaceViewsBeneath(root: View, base: Bitmap, done: (Bitmap) -> Unit) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) return done(base) // PixelCopy(SurfaceView): API 24
+        val surfaces = mutableListOf<SurfaceView>()
+        collectSurfaceViews(root, surfaces)
+        if (surfaces.isEmpty() || root.width <= 0 || root.height <= 0) return done(base)
+
+        val handler = mainHandler ?: return done(base)
+        val rootLocation = IntArray(2).also { root.getLocationOnScreen(it) }
+        // The capture bitmap is display-sized; PixelCopy scaled the window into it.
+        val scaleX = base.width / root.width.toFloat()
+        val scaleY = base.height / root.height.toFloat()
+        val copies = arrayOfNulls<Bitmap>(surfaces.size)
+        val targets = arrayOfNulls<RectF>(surfaces.size)
+        var pending = surfaces.size
+        var finished = false
+        lateinit var timeout: Runnable
+
+        fun finish() {
+            if (finished) return
+            finished = true
+            handler.removeCallbacks(timeout)
+            val ready = copies.indices.filter { copies[it] != null }
+            if (ready.isEmpty()) return done(base)
+            val out = try {
+                Bitmap.createBitmap(base.width, base.height, Bitmap.Config.ARGB_8888)
+            } catch (e: Throwable) {
+                ready.forEach { copies[it]?.recycle() }
+                DebugUtils.log("SurfaceView compose skipped: ${e.message}")
+                return done(base)
+            }
+            val canvas = Canvas(out)
+            canvas.save()
+            canvas.scale(scaleX, scaleY)
+            for (i in ready) {
+                canvas.drawBitmap(copies[i]!!, null, targets[i]!!, null)
+                copies[i]!!.recycle()
+            }
+            canvas.restore()
+            canvas.drawBitmap(base, 0f, 0f, null)
+            base.recycle()
+            done(out)
+        }
+        timeout = Runnable { finish() }
+
+        surfaces.forEachIndexed { i, sv ->
+            var requested = false
+            try {
+                val location = IntArray(2).also { sv.getLocationOnScreen(it) }
+                val left = (location[0] - rootLocation[0]).toFloat()
+                val top = (location[1] - rootLocation[1]).toFloat()
+                targets[i] = RectF(left, top, left + sv.width, top + sv.height)
+                val copy = Bitmap.createBitmap(sv.width, sv.height, Bitmap.Config.ARGB_8888)
+                PixelCopy.request(sv, copy, { copyResult ->
+                    if (finished || copyResult != PixelCopy.SUCCESS) {
+                        copy.recycle()
+                    } else {
+                        copies[i] = copy
+                    }
+                    if (!finished && --pending == 0) finish()
+                }, handler)
+                requested = true
+            } catch (e: Exception) {
+                // e.g. "Surface isn't valid" when the surface was released between the check and the copy
+                DebugUtils.log("SurfaceView copy skipped: ${e.message}")
+            }
+            if (!requested) pending--
+        }
+        if (pending == 0) finish() else handler.postDelayed(timeout, SURFACE_COPY_TIMEOUT_MS)
+    }
+
+    private fun collectSurfaceViews(view: View, into: MutableList<SurfaceView>) {
+        if (view.visibility != View.VISIBLE) return
+        if (view is SurfaceView) {
+            if (view.width > 0 && view.height > 0 && view.isShown && view.holder.surface.isValid) into.add(view)
+            return
+        }
+        if (view is ViewGroup) {
+            for (i in 0 until view.childCount) collectSurfaceViews(view.getChildAt(i), into)
         }
     }
 
