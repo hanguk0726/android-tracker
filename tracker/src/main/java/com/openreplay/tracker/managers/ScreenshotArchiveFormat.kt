@@ -1,5 +1,6 @@
 package com.openreplay.tracker.managers
 
+import java.io.File
 import java.io.OutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -18,6 +19,22 @@ internal object ScreenshotArchiveFormat {
     private const val FRAMES_SUFFIX = ".gz"
     private const val TAR_SUFFIX = ".tar.gz"
     private const val TMP_SUFFIX = ".tmp"
+
+    /** Under `Context.filesDir`: raw frames not yet archived, and archives not yet uploaded. */
+    const val SCREENSHOTS_DIR = "screenshots"
+    const val ARCHIVES_DIR = "archives"
+
+    /**
+     * Deletes every file left in [SCREENSHOTS_DIR] and [ARCHIVES_DIR] under [filesDir] and
+     * returns how many were removed. Called when a new session starts: uploads authorize with
+     * the *current* session token, so an archive left over from an earlier session (e.g. one
+     * that kept failing with 401 after that token expired) would otherwise be filed under the
+     * new session and replay frames from hours or days before it began.
+     */
+    fun purgeLeftovers(filesDir: File): Int =
+        listOf(SCREENSHOTS_DIR, ARCHIVES_DIR)
+            .flatMap { File(filesDir, it).listFiles()?.toList().orEmpty() }
+            .count { it.isFile && it.delete() }
 
     /** Writes `[ timestamp : uint64 LE ][ size : uint32 LE ][ jpeg bytes ]` to [out]. */
     fun writeFrameRecord(out: OutputStream, timestamp: Long, jpeg: ByteArray) {

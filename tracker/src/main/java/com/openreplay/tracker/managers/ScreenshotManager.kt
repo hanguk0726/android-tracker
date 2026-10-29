@@ -109,9 +109,14 @@ object ScreenshotManager {
         firstTs = startTs.toString()
         firstFrameCaptured.set(false)
         scope.launch {
-            // Drop leftovers from a previous run that never got archived — they
-            // carry pre-session timestamps and would pollute this session's replay.
-            runCatching { getScreenshotFolder().listFiles()?.forEach { it.delete() } }
+            // Drop leftovers from earlier sessions — frames never archived and archives never
+            // uploaded. Both carry pre-session timestamps, and uploads use this session's token,
+            // so they would pollute this session's replay. Under the mutex so a previous
+            // session's terminate() archiving can't land between the purge and the first frame.
+            archiveMutex.withLock {
+                runCatching { ScreenshotArchiveFormat.purgeLeftovers(context.filesDir) }
+                    .onSuccess { if (it > 0) DebugUtils.log("Dropped $it leftover screenshot file(s) from earlier sessions") }
+            }
             makeScreenshotAndSaveWithArchive()
         }
     }
@@ -359,12 +364,12 @@ object ScreenshotManager {
 
     private fun getArchiveFolder(): File {
         val context = uiContext.get() ?: throw IllegalStateException("No context")
-        return File(context.filesDir, "archives").apply { mkdirs() }
+        return File(context.filesDir, ScreenshotArchiveFormat.ARCHIVES_DIR).apply { mkdirs() }
     }
 
     private fun getScreenshotFolder(): File {
         val context = uiContext.get() ?: throw IllegalStateException("No context")
-        return File(context.filesDir, "screenshots").apply { mkdirs() }
+        return File(context.filesDir, ScreenshotArchiveFormat.SCREENSHOTS_DIR).apply { mkdirs() }
     }
 
     private suspend fun captureScreenshot(): Bitmap {
