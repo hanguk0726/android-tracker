@@ -584,7 +584,11 @@ object NetworkManager {
                         }
                     } catch (e: Exception) {
                         DebugUtils.error("Error sending images: ${e.message}")
-                        if (!gotReply && e !is java.util.concurrent.CancellationException) reportUploadFailure(null, IMAGES_URL)
+                        // An archive purged on purpose (a new session drops the previous session's
+                        // archives, ScreenshotManager) fails with ENOENT — not an upload failure.
+                        if (!gotReply && e !is java.util.concurrent.CancellationException && images.exists()) {
+                            reportUploadFailure(null, IMAGES_URL)
+                        }
                     } finally {
                         request?.disconnect()
                         if (success) {
