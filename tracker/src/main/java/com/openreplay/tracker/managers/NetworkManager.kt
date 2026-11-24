@@ -50,6 +50,25 @@ object NetworkManager {
 
     @Volatile
     var sessionId: String? = null
+
+    /**
+     * revita.4: called (on the network thread) whenever an ingest call fails — a non-2xx reply,
+     * or a transport error with no reply (statusCode null). The SDK otherwise drops the upload
+     * silently; this lets the host app report it. path is the request path (".../v1/mobile/i"),
+     * sessionId the session the call belonged to.
+     */
+    @Volatile
+    var onUploadFailure: ((statusCode: Int?, path: String, sessionId: String?) -> Unit)? = null
+
+    private fun reportUploadFailure(statusCode: Int?, path: String) {
+        val callback = onUploadFailure ?: return
+        try {
+            val fullPath = try { URL(baseUrl + path).path } catch (e: Exception) { path }
+            callback(statusCode, fullPath, sessionId)
+        } catch (e: Exception) {
+            DebugUtils.error("onUploadFailure callback failed: ${e.message}")
+        }
+    }
     // From the /start response; selects the screenshot batch format and the
     // `type=frames` form field on /images. Reset on every new session.
     @Volatile
@@ -190,6 +209,7 @@ object NetworkManager {
 
         val json = Gson().toJson(params).toByteArray()
         var request: HttpURLConnection? = null
+        var gotReply = false
 
         return try {
             request = createRequest(
@@ -200,9 +220,11 @@ object NetworkManager {
             )
 
             val responseCode = request.responseCode
+            gotReply = true
             if (responseCode !in 200..299) {
                 val errorBody = readErrorStream(request)
                 DebugUtils.error("createSession failed with code $responseCode: $errorBody")
+                reportUploadFailure(responseCode, START_URL)
                 return null
             }
 
@@ -220,6 +242,7 @@ object NetworkManager {
             }
         } catch (e: Exception) {
             DebugUtils.error("Error in createSession: ${e.message}")
+            if (!gotReply && e !is java.util.concurrent.CancellationException) reportUploadFailure(null, START_URL)
             null
         } finally {
             request?.disconnect()
@@ -263,6 +286,7 @@ object NetworkManager {
             }
 
             var request: HttpURLConnection? = null
+            var gotReply = false
             try {
                 request = createRequest(
                     "POST",
@@ -276,16 +300,19 @@ object NetworkManager {
                 )
 
                 val responseCode = request.responseCode
+                gotReply = true
                 if (responseCode in 200..299) {
                     DebugUtils.log("Message sent successfully")
                     withContext(Dispatchers.Main) { completion(true) }
                 } else {
                     val errorBody = readErrorStream(request)
                     DebugUtils.error("Failed to send message: $responseCode - $errorBody")
+                    reportUploadFailure(responseCode, INGEST_URL)
                     withContext(Dispatchers.Main) { completion(false) }
                 }
             } catch (e: Exception) {
                 DebugUtils.error("Message sending failed: ${e.message}")
+                if (!gotReply && e !is java.util.concurrent.CancellationException) reportUploadFailure(null, INGEST_URL)
                 withContext(Dispatchers.Main) { completion(false) }
             } finally {
                 request?.disconnect()
@@ -308,6 +335,7 @@ object NetworkManager {
             }
 
             var request: HttpURLConnection? = null
+            var gotReply = false
             try {
                 request = createRequest(
                     method = "GET",
@@ -316,9 +344,11 @@ object NetworkManager {
                 )
 
                 val responseCode = request.responseCode
+                gotReply = true
                 if (responseCode !in 200..299) {
                     val errorBody = readErrorStream(request)
                     DebugUtils.error("getConditions failed with code $responseCode: $errorBody")
+                    reportUploadFailure(responseCode, CONDITIONS)
                     withContext(Dispatchers.Main) { completion(emptyList()) }
                     return@launch
                 }
@@ -335,6 +365,7 @@ object NetworkManager {
                 withContext(Dispatchers.Main) { completion(conditions) }
             } catch (e: Exception) {
                 DebugUtils.error("Conditions fetch error: ${e.message}")
+                if (!gotReply && e !is java.util.concurrent.CancellationException) reportUploadFailure(null, CONDITIONS)
                 withContext(Dispatchers.Main) { completion(emptyList()) }
             } finally {
                 request?.disconnect()
@@ -393,6 +424,7 @@ object NetworkManager {
             }
 
             var request: HttpURLConnection? = null
+            var gotReply = false
             try {
                 request = createRequest(
                     method = "POST",
@@ -406,16 +438,19 @@ object NetworkManager {
                 )
 
                 val responseCode = request.responseCode
+                gotReply = true
                 if (responseCode in 200..299) {
                     DebugUtils.log("Late message sent successfully")
                     withContext(Dispatchers.Main) { completion(true) }
                 } else {
                     val errorBody = readErrorStream(request)
                     DebugUtils.error("Failed to send late message: $responseCode - $errorBody")
+                    reportUploadFailure(responseCode, LATE_URL)
                     withContext(Dispatchers.Main) { completion(false) }
                 }
             } catch (e: Exception) {
                 DebugUtils.error("Error sending late message: ${e.message}")
+                if (!gotReply && e !is java.util.concurrent.CancellationException) reportUploadFailure(null, LATE_URL)
                 withContext(Dispatchers.Main) { completion(false) }
             } finally {
                 request?.disconnect()
@@ -507,6 +542,7 @@ object NetworkManager {
 
                 imageUploadSemaphore.withPermit {
                     var success = false
+                    var gotReply = false
                     var request: HttpURLConnection? = null
                     try {
                         val boundary = "Boundary-${UUID.randomUUID()}"
@@ -537,15 +573,18 @@ object NetworkManager {
                         )
 
                         val responseCode = request.responseCode
+                        gotReply = true
                         if (responseCode in 200..299) {
                             success = true
                             DebugUtils.log("Images sent successfully")
                         } else {
                             val errorBody = readErrorStream(request)
                             DebugUtils.error("Failed to send images: $responseCode - $errorBody")
+                            reportUploadFailure(responseCode, IMAGES_URL)
                         }
                     } catch (e: Exception) {
                         DebugUtils.error("Error sending images: ${e.message}")
+                        if (!gotReply && e !is java.util.concurrent.CancellationException) reportUploadFailure(null, IMAGES_URL)
                     } finally {
                         request?.disconnect()
                         if (success) {
