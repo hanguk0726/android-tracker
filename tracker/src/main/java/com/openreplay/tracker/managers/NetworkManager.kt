@@ -60,11 +60,14 @@ object NetworkManager {
     @Volatile
     var onUploadFailure: ((statusCode: Int?, path: String, sessionId: String?) -> Unit)? = null
 
-    private fun reportUploadFailure(statusCode: Int?, path: String) {
+    // requestSessionId = the session whose token the failed request carried (captured with the token),
+    // not the session current at report time — after a restart an old-token upload must not be pinned
+    // on the new session. null for requests that belong to no live session (/start, /late). revita.6
+    private fun reportUploadFailure(statusCode: Int?, path: String, requestSessionId: String?) {
         val callback = onUploadFailure ?: return
         try {
             val fullPath = try { URL(baseUrl + path).path } catch (e: Exception) { path }
-            callback(statusCode, fullPath, sessionId)
+            callback(statusCode, fullPath, requestSessionId)
         } catch (e: Exception) {
             DebugUtils.error("onUploadFailure callback failed: ${e.message}")
         }
@@ -224,7 +227,7 @@ object NetworkManager {
             if (responseCode !in 200..299) {
                 val errorBody = readErrorStream(request)
                 DebugUtils.error("createSession failed with code $responseCode: $errorBody")
-                reportUploadFailure(responseCode, START_URL)
+                reportUploadFailure(responseCode, START_URL, null)
                 return null
             }
 
@@ -242,7 +245,7 @@ object NetworkManager {
             }
         } catch (e: Exception) {
             DebugUtils.error("Error in createSession: ${e.message}")
-            if (!gotReply && e !is java.util.concurrent.CancellationException) reportUploadFailure(null, START_URL)
+            if (!gotReply && e !is java.util.concurrent.CancellationException) reportUploadFailure(null, START_URL, null)
             null
         } finally {
             request?.disconnect()
@@ -287,6 +290,7 @@ object NetworkManager {
 
             var request: HttpURLConnection? = null
             var gotReply = false
+            val requestSessionId = sessionId
             try {
                 request = createRequest(
                     "POST",
@@ -307,12 +311,12 @@ object NetworkManager {
                 } else {
                     val errorBody = readErrorStream(request)
                     DebugUtils.error("Failed to send message: $responseCode - $errorBody")
-                    reportUploadFailure(responseCode, INGEST_URL)
+                    reportUploadFailure(responseCode, INGEST_URL, requestSessionId)
                     withContext(Dispatchers.Main) { completion(false) }
                 }
             } catch (e: Exception) {
                 DebugUtils.error("Message sending failed: ${e.message}")
-                if (!gotReply && e !is java.util.concurrent.CancellationException) reportUploadFailure(null, INGEST_URL)
+                if (!gotReply && e !is java.util.concurrent.CancellationException) reportUploadFailure(null, INGEST_URL, requestSessionId)
                 withContext(Dispatchers.Main) { completion(false) }
             } finally {
                 request?.disconnect()
@@ -322,6 +326,7 @@ object NetworkManager {
 
     fun getConditions(completion: (List<ApiResponse>) -> Unit) {
         networkScope.launch {
+            val requestSessionId = sessionId
             val token = this@NetworkManager.token ?: run {
                 DebugUtils.error("No token available for getConditions.")
                 withContext(Dispatchers.Main) { completion(emptyList()) }
@@ -348,7 +353,7 @@ object NetworkManager {
                 if (responseCode !in 200..299) {
                     val errorBody = readErrorStream(request)
                     DebugUtils.error("getConditions failed with code $responseCode: $errorBody")
-                    reportUploadFailure(responseCode, CONDITIONS)
+                    reportUploadFailure(responseCode, CONDITIONS, requestSessionId)
                     withContext(Dispatchers.Main) { completion(emptyList()) }
                     return@launch
                 }
@@ -365,7 +370,7 @@ object NetworkManager {
                 withContext(Dispatchers.Main) { completion(conditions) }
             } catch (e: Exception) {
                 DebugUtils.error("Conditions fetch error: ${e.message}")
-                if (!gotReply && e !is java.util.concurrent.CancellationException) reportUploadFailure(null, CONDITIONS)
+                if (!gotReply && e !is java.util.concurrent.CancellationException) reportUploadFailure(null, CONDITIONS, requestSessionId)
                 withContext(Dispatchers.Main) { completion(emptyList()) }
             } finally {
                 request?.disconnect()
@@ -445,12 +450,12 @@ object NetworkManager {
                 } else {
                     val errorBody = readErrorStream(request)
                     DebugUtils.error("Failed to send late message: $responseCode - $errorBody")
-                    reportUploadFailure(responseCode, LATE_URL)
+                    reportUploadFailure(responseCode, LATE_URL, null)
                     withContext(Dispatchers.Main) { completion(false) }
                 }
             } catch (e: Exception) {
                 DebugUtils.error("Error sending late message: ${e.message}")
-                if (!gotReply && e !is java.util.concurrent.CancellationException) reportUploadFailure(null, LATE_URL)
+                if (!gotReply && e !is java.util.concurrent.CancellationException) reportUploadFailure(null, LATE_URL, null)
                 withContext(Dispatchers.Main) { completion(false) }
             } finally {
                 request?.disconnect()
@@ -522,6 +527,7 @@ object NetworkManager {
             }
 
             try {
+                val requestSessionId = sessionId
                 val token = this@NetworkManager.token ?: run {
                     DebugUtils.error("No token available for sendImages.")
                     report(false)
@@ -580,14 +586,14 @@ object NetworkManager {
                         } else {
                             val errorBody = readErrorStream(request)
                             DebugUtils.error("Failed to send images: $responseCode - $errorBody")
-                            reportUploadFailure(responseCode, IMAGES_URL)
+                            reportUploadFailure(responseCode, IMAGES_URL, requestSessionId)
                         }
                     } catch (e: Exception) {
                         DebugUtils.error("Error sending images: ${e.message}")
                         // An archive purged on purpose (a new session drops the previous session's
                         // archives, ScreenshotManager) fails with ENOENT — not an upload failure.
                         if (!gotReply && e !is java.util.concurrent.CancellationException && images.exists()) {
-                            reportUploadFailure(null, IMAGES_URL)
+                            reportUploadFailure(null, IMAGES_URL, requestSessionId)
                         }
                     } finally {
                         request?.disconnect()
